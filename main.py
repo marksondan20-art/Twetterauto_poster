@@ -115,7 +115,7 @@ def list_recent_posts(limit=12, max_age_days=7):
     bid = _blog_id(svc)
     items = svc.posts().list(
         blogId=bid, fetchBodies=False, maxResults=limit,
-        orderBy="PUBLISHED", status=["live"]
+        orderBy="PUBLISHED", status=["LIVE"]
     ).execute().get("items", [])
     cutoff = datetime.utcnow() - timedelta(days=max_age_days)
     out=[]
