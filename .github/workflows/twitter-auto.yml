@@ -1,21 +1,21 @@
-name: Twitter poster (12:00 & 19:00 Baghdad)
+name: X Poster (12:00 & 19:00 Baghdad)
 
 on:
   schedule:
-    # GitHub = UTC ; Baghdad = UTC+03:00
+    # GitHub يعمل بـ UTC — بغداد = UTC+03:00
     - cron: '0 9 * * *'   # 12:00 Baghdad
     - cron: '0 16 * * *'  # 19:00 Baghdad
   workflow_dispatch:
     inputs:
       mode:
-        description: 'publish or run_once'
+        description: 'publish | run_once'
         type: choice
         options: [publish, run_once]
         default: publish
       count:
-        description: 'times for run_once (1-3)'
-        required: false
+        description: 'كم تغريدة في هذا التشغيل (1-3)'
         default: '1'
+        required: false
 
 permissions:
   contents: read
@@ -25,17 +25,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
-      # Twitter (OAuth 1.0a – لازم تكون مفاتيح user context)
-      TW_API_KEY:        ${{ secrets.TW_API_KEY }}
-      TW_API_SECRET:     ${{ secrets.TW_API_SECRET }}
-      TW_ACCESS_TOKEN:   ${{ secrets.TW_ACCESS_TOKEN }}
-      TW_ACCESS_SECRET:  ${{ secrets.TW_ACCESS_SECRET }}
-      # مصدر المقالات (رابط مدونتك)
-      BLOG_URL:          ${{ secrets.BLOG_URL }}
       TZ: Asia/Baghdad
 
     steps:
-      - name: Checkout repository
+      - name: Checkout repo
         uses: actions/checkout@v4
 
       - name: Set up Python
@@ -46,84 +39,90 @@ jobs:
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install tweepy==4.14.0 requests==2.32.3 feedparser==6.0.11
+          pip install tweepy>=4.14.0 requests>=2.32.3
 
-      # اختياري: تشخيص توثيق X (يفيدك قبل أول نشر)
-      - name: Diagnose Twitter auth
+      - name: Decide task
+        id: decide
         run: |
-          python - <<'PY'
-          import os, sys, tweepy
-          need = ["TW_API_KEY","TW_API_SECRET","TW_ACCESS_TOKEN","TW_ACCESS_SECRET"]
-          miss = [k for k in need if not os.getenv(k)]
-          if miss:
-              print("MISSING SECRETS:", miss); sys.exit(1)
-          auth = tweepy.OAuth1UserHandler(
-              os.environ["TW_API_KEY"], os.environ["TW_API_SECRET"],
-              os.environ["TW_ACCESS_TOKEN"], os.environ["TW_ACCESS_SECRET"]
-          )
-          api = tweepy.API(auth, wait_on_rate_limit=True)
-          me = api.verify_credentials()
-          if not me: 
-              raise SystemExit("verify_credentials returned None")
-          print("AUTH_OK:", "@"+me.screen_name)
-          PY
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            echo "task=publish" >> "$GITHUB_OUTPUT"
+            echo "count=1"     >> "$GITHUB_OUTPUT"
+          else
+            echo "task=${{ inputs.mode }}"  >> "$GITHUB_OUTPUT"
+            echo "count=${{ inputs.count }}" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Publish now
         env:
-          MODE:  ${{ github.event_name == 'schedule' && 'publish' || inputs.mode }}
-          COUNT: ${{ github.event_name == 'schedule' && '1'      || inputs.count }}
+          MODE:  ${{ steps.decide.outputs.task }}
+          COUNT: ${{ steps.decide.outputs.count }}
+          TW_API_KEY:        ${{ secrets.TW_API_KEY }}
+          TW_API_SECRET:     ${{ secrets.TW_API_SECRET }}
+          TW_ACCESS_TOKEN:   ${{ secrets.TW_ACCESS_TOKEN }}
+          TW_ACCESS_SECRET:  ${{ secrets.TW_ACCESS_SECRET }}
         run: |
           echo "MODE=${MODE}  COUNT=${COUNT:-1}"
           python - <<'PY'
-          import os, re, textwrap, tweepy, requests, feedparser
+          import os, sys, textwrap, time
+          import tweepy
 
-          # --- helpers ---
-          def latest_posts(blog_url, n=1):
-              # Blogger RSS (يعمل لمدونات blogspot ولأي BLOG_URL فيه خلاصة)
-              rss = blog_url.rstrip("/") + "/feeds/posts/default?alt=rss"
-              f = feedparser.parse(rss)
-              out=[]
-              for e in (f.entries or [])[:n]:
-                  title = e.title
-                  link  = getattr(e, "link", blog_url)
-                  out.append((title, link))
-              return out
+          def make_client():
+              try:
+                  client = tweepy.Client(
+                      consumer_key=os.environ["TW_API_KEY"],
+                      consumer_secret=os.environ["TW_API_SECRET"],
+                      access_token=os.environ["TW_ACCESS_TOKEN"],
+                      access_token_secret=os.environ["TW_ACCESS_SECRET"],
+                      wait_on_rate_limit=True,
+                  )
+                  me = client.get_me()
+                  print("AUTH_OK for:", "@"+me.data.username)
+                  return client
+              except Exception as e:
+                  print("AUTH_FAIL:", repr(e))
+                  print(textwrap.dedent("""
+                  تأكد من:
+                  1) App permissions = Read and write في بوابة X
+                  2) أعد توليد Access Token & Secret بعد تغيير الصلاحيات
+                  3) القيم الأربع كلها لنفس التطبيق ونفس الحساب
+                  """).strip())
+                  sys.exit(1)
 
-          def make_tweet(title, url):
-              base = f"{title.strip()} — {url.strip()}  #لودينغ"
-              # التقييد 280 حرف
-              return base if len(base) <= 280 else (base[:276] + "…")
+          def post_tweet_v2(client, text):
+              try:
+                  r = client.create_tweet(text=text)
+                  tid = r.data.get("id")
+                  print("TWEET_OK:", f"https://x.com/i/web/status/{tid}")
+                  return True
+              except tweepy.Forbidden as e:
+                  print("403 Forbidden:", e)
+                  print("الحل: استخدم v2 (create_tweet) مع Read/Write، وإن استمر راجع الخطة/الصلاحيات.")
+                  return False
+              except Exception as e:
+                  print("TWEET_ERR:", repr(e))
+                  return False
 
-          # --- twitter api ---
-          auth = tweepy.OAuth1UserHandler(
-              os.environ["TW_API_KEY"], os.environ["TW_API_SECRET"],
-              os.environ["TW_ACCESS_TOKEN"], os.environ["TW_ACCESS_SECRET"]
-          )
-          api = tweepy.API(auth, wait_on_rate_limit=True)
+          MODE  = os.getenv("MODE","publish")
+          COUNT = int(os.getenv("COUNT") or 1)
 
-          blog = os.environ.get("BLOG_URL","").strip()
-          if not blog:
-              raise SystemExit("BLOG_URL secret is empty")
+          client = make_client()
 
-          mode  = os.environ.get("MODE","publish")
-          count = int(os.environ.get("COUNT") or 1)
-          count = max(1, min(3, count))
+          # ضع منطق جلب عنوان/رابط مقالاتك هنا لاحقاً. حالياً نصوص تجريبية:
+          base_texts = [
+              "مقال جديد على موقعنا: هل الذكاء الاصطناعي يُعيد تشكيل حياتنا اليومية؟ #لودينغ",
+              "تحليل سريع لخبر تقني ترند — التفاصيل على موقعنا. #لودينغ",
+              "أبرز ما حدث اليوم في عالم التكنولوجيا… القراءة الكاملة بالمصدر. #لودينغ",
+          ]
 
-          if mode == "publish":
-              posts = latest_posts(blog, n=1)
-              if not posts:
-                  raise SystemExit("No posts found in feed")
-              title, link = posts[0]
-              text = make_tweet(title, link)
-              api.update_status(status=text)
-              print("TWEETED:", text)
+          ok_any = False
+          for i in range(COUNT):
+              text = base_texts[i % len(base_texts)]
+              # مثال دمج العنوان والرابط عند ربطه مع موقعك:
+              # text = f"{title}\n{url}\n#لودينغ"
+              ok = post_tweet_v2(client, text)
+              ok_any = ok_any or ok
+              time.sleep(2)
 
-          else:  # run_once (لل manual test – يكرر n مرات من أحدث المقالات)
-              posts = latest_posts(blog, n=count)
-              if not posts:
-                  raise SystemExit("No posts found in feed")
-              for title, link in posts:
-                  text = make_tweet(title, link)
-                  api.update_status(status=text)
-                  print("TWEETED:", text)
+          if not ok_any:
+              sys.exit(1)
           PY
