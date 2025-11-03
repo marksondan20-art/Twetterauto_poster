@@ -1,4 +1,4 @@
-name: Tweet site posts (12:00 & 19:00 Baghdad)
+name: Tweet blog posts (12:00 & 19:00 Baghdad)
 
 on:
   schedule:
@@ -7,10 +7,11 @@ on:
     - cron: '0 16 * * *'  # 19:00 Baghdad
   workflow_dispatch:
     inputs:
-      dry_run:
-        description: 'لا تنشر، فقط اختبر الاتصال (0/1)'
-        required: false
-        default: '0'
+      mode:
+        description: 'publish | retweet_once'
+        type: choice
+        options: [publish, retweet_once]
+        default: publish
 
 permissions:
   contents: read
@@ -19,21 +20,19 @@ jobs:
   run:
     runs-on: ubuntu-latest
     timeout-minutes: 20
-
     env:
-      BLOG_RSS:              ${{ secrets.BLOG_RSS }}         # مثال: https://loadingapk391.blogspot.com/feeds/posts/default?alt=rss
-      TW_API_KEY:            ${{ secrets.TW_API_KEY }}
-      TW_API_SECRET:         ${{ secrets.TW_API_SECRET }}
-      TW_ACCESS_TOKEN:       ${{ secrets.TW_ACCESS_TOKEN }}
-      TW_ACCESS_SECRET:      ${{ secrets.TW_ACCESS_SECRET }}
-      DRY_RUN:               ${{ inputs.dry_run || '0' }}
-      TZ:                    Asia/Baghdad
+      BLOG_URL: ${{ secrets.BLOG_URL }}
+      TW_API_KEY: ${{ secrets.TW_API_KEY }}
+      TW_API_SECRET: ${{ secrets.TW_API_SECRET }}
+      TW_ACCESS_TOKEN: ${{ secrets.TW_ACCESS_TOKEN }}
+      TW_ACCESS_SECRET: ${{ secrets.TW_ACCESS_SECRET }}
+      TZ: Asia/Baghdad
 
     steps:
-      - name: Checkout repo
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Python
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
@@ -41,72 +40,139 @@ jobs:
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install tweepy==4.14.0 requests==2.32.3 feedparser==6.0.11
+
+      - name: Check secrets lengths (quick sanity)
+        run: |
+          python - <<'PY'
+          import os
+          for k in ["TW_API_KEY","TW_API_SECRET","TW_ACCESS_TOKEN","TW_ACCESS_SECRET","BLOG_URL"]:
+              v=os.getenv(k,"")
+              print(f"{k}: len={len(v)} tail={v[-4:] if v else 'None'}")
+          PY
 
       - name: Diagnose Twitter auth
         run: |
           python - <<'PY'
-          import os, tweepy, sys
+          import os, tweepy, sys, textwrap
           try:
               auth = tweepy.OAuth1UserHandler(
                   os.environ["TW_API_KEY"], os.environ["TW_API_SECRET"],
                   os.environ["TW_ACCESS_TOKEN"], os.environ["TW_ACCESS_SECRET"]
               )
-              api = tweepy.API(auth)
+              api = tweepy.API(auth, wait_on_rate_limit=True)
               me = api.verify_credentials()
-              print("AUTH_OK for:", me.screen_name)
+              print("AUTH_OK for:", "@"+me.screen_name)
           except Exception as e:
               print("AUTH_FAIL:", repr(e))
+              print(textwrap.dedent("""
+              تحقق من الآتي:
+              1) App permissions = Read and write في بوابة X
+              2) Regenerate Access Token & Secret بعد أي تغيير للصلاحيات
+              3) كل القيم تخص نفس الـ App ونفس الحساب الذي سيغرد
+              4) لا توجد مسافات/اقتباسات زائدة داخل Secrets
+              """).strip())
               sys.exit(1)
           PY
 
-      - name: Run poster
+      - name: Publish now
+        env:
+          MODE: ${{ inputs.mode || 'publish' }}
         run: |
           python - <<'PY'
-          import os, re, time, feedparser, tweepy
-          from urllib.parse import urlparse, parse_qs
+          import os, re, time, random, requests, feedparser, datetime
+          import tweepy
+          from urllib.parse import urljoin
 
-          DRY = os.getenv("DRY_RUN","0") == "1"
-          RSS = os.getenv("BLOG_RSS","").strip()
+          TZ = datetime.timezone(datetime.timedelta(hours=3))  # بغداد
+          YT = "https://www.youtube.com/@-Muhamedloading"
 
-          if not RSS:
-              raise SystemExit("BLOG_RSS secret مفقود (مثال صالح: https://<blog>.blogspot.com/feeds/posts/default?alt=rss)")
+          def fetch_feed_posts(blog_url, max_items=20):
+              # نستخدم Atom/JSON العام لتفادي أي مفاتيح إضافية
+              # Atom:
+              atom = f"{blog_url.rstrip('/')}/feeds/posts/default"
+              try:
+                  feed = feedparser.parse(atom + "?alt=rss")
+                  items = []
+                  for e in feed.entries[:max_items]:
+                      title = e.title
+                      link  = getattr(e, "link", None) or blog_url
+                      # تاريخ تقريبي
+                      dt = getattr(e, "published_parsed", None) or getattr(e,"updated_parsed",None)
+                      if dt:
+                          dt = datetime.datetime(*dt[:6], tzinfo=datetime.timezone.utc).astimezone(TZ)
+                      else:
+                          dt = datetime.datetime.now(TZ)
+                      items.append({"title":title, "url":link, "dt":dt})
+                  return items
+              except Exception:
+                  return []
 
-          # --- اجلب أحدث 3 مقالات من RSS
-          feed = feedparser.parse(RSS)
-          items = feed.entries[:3] if feed.entries else []
-          if not items:
-              raise SystemExit("لا توجد عناصر RSS لعرضها.")
+          def as_question(title:str)->str:
+              t = re.sub(r"\s+", " ", title).strip()
+              # توليد قالب سؤال بسيط ومتغير
+              templates = [
+                  "ما القصة وراء «{t}»؟",
+                  "هل فعلاً {t}؟",
+                  "كيف بدأ موضوع «{t}» ولماذا يهمّنا الآن؟",
+                  "ماذا يعني {t} للناس اليوم؟",
+              ]
+              return random.choice(templates).format(t=t)
 
-          # --- جهّز تويتر (OAuth 1.0a user context)
+          def build_tweet(title, url):
+              q = as_question(title)
+              teaser = "إذا حابب تعرف أكتر، لودينغ موجودة لخدمتكم — تابع القراءة من الموقع الرسمي:"
+              tag = "#لودينغ"
+              # حاول تقصير نص التغريدة ضمن 280 حرفًا
+              base = f"{q}\n\n{teaser}\n{url}\n{tag}\nقناتنا: {YT}"
+              if len(base) <= 280: 
+                  return base
+              # إذا كانت طويلة، اختصر العنوان
+              short = (q[:120] + "…") if len(q) > 120 else q
+              base = f"{short}\n{url}\n{tag}\nقناتنا: {YT}"
+              return base[:280]
+
+          def tweet(api, text):
+              api.update_status(status=text)
+              print("TWEETED:", text.replace("\n"," | ")[:120], "...")
+
+          def pick_throwback(items):
+              # اختر مقالاً عمره ≥3 أيام، عشوائيًا من الخمسة الأوائل المتوافقين
+              cutoff = datetime.datetime.now(TZ) - datetime.timedelta(days=3)
+              older = [it for it in items if it["dt"] <= cutoff]
+              older.sort(key=lambda x: x["dt"])  # أقدم أولاً
+              pool = older[:20] if len(older)>20 else older
+              return random.choice(pool) if pool else None
+
+          mode = os.getenv("MODE","publish")
+          blog = os.environ["BLOG_URL"]
+
           auth = tweepy.OAuth1UserHandler(
               os.environ["TW_API_KEY"], os.environ["TW_API_SECRET"],
               os.environ["TW_ACCESS_TOKEN"], os.environ["TW_ACCESS_SECRET"]
           )
-          api = tweepy.API(auth)
+          api  = tweepy.API(auth, wait_on_rate_limit=True)
 
-          posted = 0
-          for e in items:
-              title = (getattr(e, "title", "") or "").strip()
-              link  = (getattr(e, "link", "") or "").strip()
-              if not title or not link:
-                  continue
+          posts = fetch_feed_posts(blog, max_items=30)
+          if not posts:
+              raise SystemExit("لم أستطع جلب أي مقالات من الخلاصة العامة.")
 
-              # صيغة سؤال جذّاب + هاشتاغ #لودينغ + رابط القناة
-              yt = "https://www.youtube.com/@-Muhamedloading"
-              text = f"سؤال: {title}؟\nإذا حابب تعرف أكتر، لودينغ موجودة لخدمتكم — تابع القراءة من الموقع الرسمي:\n{link}\n\n#لودينغ\nقناتنا على يوتيوب: {yt}"
+          # أحدث مقال دائمًا هو الأول
+          latest = sorted(posts, key=lambda x: x["dt"], reverse=True)[0]
 
-              if DRY:
-                  print("DRY_RUN →", text[:120].replace("\n"," ") + "...")
+          now = datetime.datetime.now(TZ)
+          should_throwback = ((now.toordinal() % 3) == 0 and now.hour == 12)  # كل 72 ساعة عند 12:00
+
+          if mode == "retweet_once" or should_throwback:
+              old = pick_throwback(posts)
+              if old:
+                  text = build_tweet(old["title"], old["url"])
+                  tweet(api, text)
               else:
-                  try:
-                      api.update_status(status=text[:280])  # قصّ إلى حد تويتر
-                      print("TWEETED:", title)
-                      posted += 1
-                      time.sleep(2)
-                  except Exception as e:
-                      print("TWEET_ERROR:", title, repr(e))
-
-          if not DRY and posted == 0:
-              raise SystemExit("لم يتم نشر أي تغريدة (تحقق من الصلاحيات: Read and write).")
+                  # لا يوجد قديم مناسب، انشر الأحدث بدلًا من ذلك
+                  text = build_tweet(latest["title"], latest["url"])
+                  tweet(api, text)
+          else:
+              text = build_tweet(latest["title"], latest["url"])
+              tweet(api, text)
           PY
